@@ -1,53 +1,24 @@
 package daemon
 
-import (
-	"strconv"
-
-	"github.com/docker/docker/engine"
-)
-
-func (daemon *Daemon) ContainerResize(job *engine.Job) engine.Status {
-	if len(job.Args) != 3 {
-		return job.Errorf("Not enough arguments. Usage: %s CONTAINER HEIGHT WIDTH\n", job.Name)
-	}
-	name := job.Args[0]
-	height, err := strconv.Atoi(job.Args[1])
+// ContainerResize changes the size of the TTY of the process running
+// in the container with the given name to the given height and width.
+func (daemon *Daemon) ContainerResize(name string, height, width int) error {
+	container, err := daemon.Get(name)
 	if err != nil {
-		return job.Error(err)
-	}
-	width, err := strconv.Atoi(job.Args[2])
-	if err != nil {
-		return job.Error(err)
+		return err
 	}
 
-	if container := daemon.Get(name); container != nil {
-		if err := container.Resize(height, width); err != nil {
-			return job.Error(err)
-		}
-		return engine.StatusOK
-	}
-	return job.Errorf("No such container: %s", name)
+	return container.Resize(height, width)
 }
 
-func (daemon *Daemon) ContainerExecResize(job *engine.Job) engine.Status {
-	if len(job.Args) != 3 {
-		return job.Errorf("Not enough arguments. Usage: %s EXEC HEIGHT WIDTH\n", job.Name)
-	}
-	name := job.Args[0]
-	height, err := strconv.Atoi(job.Args[1])
+// ContainerExecResize changes the size of the TTY of the process
+// running in the exec with the given name to the given height and
+// width.
+func (daemon *Daemon) ContainerExecResize(name string, height, width int) error {
+	ExecConfig, err := daemon.getExecConfig(name)
 	if err != nil {
-		return job.Error(err)
+		return err
 	}
-	width, err := strconv.Atoi(job.Args[2])
-	if err != nil {
-		return job.Error(err)
-	}
-	execConfig, err := daemon.getExecConfig(name)
-	if err != nil {
-		return job.Error(err)
-	}
-	if err := execConfig.Resize(height, width); err != nil {
-		return job.Error(err)
-	}
-	return engine.StatusOK
+
+	return ExecConfig.resize(height, width)
 }

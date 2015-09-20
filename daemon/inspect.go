@@ -1,85 +1,139 @@
 package daemon
 
 import (
-	"encoding/json"
 	"fmt"
+	"time"
 
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/runconfig"
+	"github.com/docker/docker/api/types"
 )
 
-func (daemon *Daemon) ContainerInspect(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("usage: %s NAME", job.Name)
+// ContainerInspect returns low-level information about a
+// container. Returns an error if the container cannot be found, or if
+// there is an error getting the data.
+func (daemon *Daemon) ContainerInspect(name string) (*types.ContainerJSON, error) {
+	container, err := daemon.Get(name)
+	if err != nil {
+		return nil, err
 	}
-	name := job.Args[0]
-	if container := daemon.Get(name); container != nil {
-		container.Lock()
-		defer container.Unlock()
-		if job.GetenvBool("raw") {
-			b, err := json.Marshal(&struct {
-				*Container
-				HostConfig *runconfig.HostConfig
-			}{container, container.hostConfig})
-			if err != nil {
-				return job.Error(err)
-			}
-			job.Stdout.Write(b)
-			return engine.StatusOK
-		}
 
-		out := &engine.Env{}
-		out.Set("Id", container.ID)
-		out.SetAuto("Created", container.Created)
-		out.SetJson("Path", container.Path)
-		out.SetList("Args", container.Args)
-		out.SetJson("Config", container.Config)
-		out.SetJson("State", container.State)
-		out.Set("Image", container.Image)
-		out.SetJson("NetworkSettings", container.NetworkSettings)
-		out.Set("ResolvConfPath", container.ResolvConfPath)
-		out.Set("HostnamePath", container.HostnamePath)
-		out.Set("HostsPath", container.HostsPath)
-		out.Set("Name", container.Name)
-		out.Set("Driver", container.Driver)
-		out.Set("ExecDriver", container.ExecDriver)
-		out.Set("MountLabel", container.MountLabel)
-		out.Set("ProcessLabel", container.ProcessLabel)
-		out.SetJson("Volumes", container.Volumes)
-		out.SetJson("VolumesRW", container.VolumesRW)
-		out.SetJson("AppArmorProfile", container.AppArmorProfile)
+	container.Lock()
+	defer container.Unlock()
 
-		if children, err := daemon.Children(container.Name); err == nil {
-			for linkAlias, child := range children {
-				container.hostConfig.Links = append(container.hostConfig.Links, fmt.Sprintf("%s:%s", child.Name, linkAlias))
-			}
-		}
-
-		out.SetJson("HostConfig", container.hostConfig)
-
-		container.hostConfig.Links = nil
-		if _, err := out.WriteTo(job.Stdout); err != nil {
-			return job.Error(err)
-		}
-		return engine.StatusOK
+	base, err := daemon.getInspectData(container)
+	if err != nil {
+		return nil, err
 	}
-	return job.Errorf("No such container: %s", name)
+
+	mountPoints := addMountPoints(container)
+
+	return &types.ContainerJSON{base, mountPoints, container.Config}, nil
 }
 
-func (daemon *Daemon) ContainerExecInspect(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("usage: %s ID", job.Name)
-	}
-	id := job.Args[0]
-	eConfig, err := daemon.getExecConfig(id)
+// ContainerInspect120 serializes the master version of a container into a json type.
+func (daemon *Daemon) ContainerInspect120(name string) (*types.ContainerJSON120, error) {
+	container, err := daemon.Get(name)
 	if err != nil {
-		return job.Error(err)
+		return nil, err
 	}
 
-	b, err := json.Marshal(*eConfig)
+	container.Lock()
+	defer container.Unlock()
+
+	base, err := daemon.getInspectData(container)
 	if err != nil {
-		return job.Error(err)
+		return nil, err
 	}
-	job.Stdout.Write(b)
-	return engine.StatusOK
+
+	mountPoints := addMountPoints(container)
+	config := &types.ContainerConfig120{
+		container.Config,
+		container.hostConfig.VolumeDriver,
+	}
+
+	return &types.ContainerJSON120{base, mountPoints, config}, nil
+}
+
+func (daemon *Daemon) getInspectData(container *Container) (*types.ContainerJSONBase, error) {
+	// make a copy to play with
+	hostConfig := *container.hostConfig
+
+	if children, err := daemon.children(container.Name); err == nil {
+		for linkAlias, child := range children {
+			hostConfig.Links = append(hostConfig.Links, fmt.Sprintf("%s:%s", child.Name, linkAlias))
+		}
+	}
+	// we need this trick to preserve empty log driver, so
+	// container will use daemon defaults even if daemon change them
+	if hostConfig.LogConfig.Type == "" {
+		hostConfig.LogConfig.Type = daemon.defaultLogConfig.Type
+	}
+
+	if len(hostConfig.LogConfig.Config) == 0 {
+		hostConfig.LogConfig.Config = daemon.defaultLogConfig.Config
+	}
+
+	containerState := &types.ContainerState{
+		Status:     container.State.StateString(),
+		Running:    container.State.Running,
+		Paused:     container.State.Paused,
+		Restarting: container.State.Restarting,
+		OOMKilled:  container.State.OOMKilled,
+		Dead:       container.State.Dead,
+		Pid:        container.State.Pid,
+		ExitCode:   container.State.ExitCode,
+		Error:      container.State.Error,
+		StartedAt:  container.State.StartedAt.Format(time.RFC3339Nano),
+		FinishedAt: container.State.FinishedAt.Format(time.RFC3339Nano),
+	}
+
+	contJSONBase := &types.ContainerJSONBase{
+		ID:              container.ID,
+		Created:         container.Created.Format(time.RFC3339Nano),
+		Path:            container.Path,
+		Args:            container.Args,
+		State:           containerState,
+		Image:           container.ImageID,
+		NetworkSettings: container.NetworkSettings,
+		LogPath:         container.LogPath,
+		Name:            container.Name,
+		RestartCount:    container.RestartCount,
+		Driver:          container.Driver,
+		ExecDriver:      container.ExecDriver,
+		MountLabel:      container.MountLabel,
+		ProcessLabel:    container.ProcessLabel,
+		ExecIDs:         container.getExecIDs(),
+		HostConfig:      &hostConfig,
+	}
+
+	// Now set any platform-specific fields
+	contJSONBase = setPlatformSpecificContainerFields(container, contJSONBase)
+
+	contJSONBase.GraphDriver.Name = container.Driver
+	graphDriverData, err := daemon.driver.GetMetadata(container.ID)
+	if err != nil {
+		return nil, err
+	}
+	contJSONBase.GraphDriver.Data = graphDriverData
+
+	return contJSONBase, nil
+}
+
+// ContainerExecInspect returns low-level information about the exec
+// command. An error is returned if the exec cannot be found.
+func (daemon *Daemon) ContainerExecInspect(id string) (*ExecConfig, error) {
+	eConfig, err := daemon.getExecConfig(id)
+	if err != nil {
+		return nil, err
+	}
+	return eConfig, nil
+}
+
+// VolumeInspect looks up a volume by name. An error is returned if
+// the volume cannot be found.
+func (daemon *Daemon) VolumeInspect(name string) (*types.Volume, error) {
+	v, err := daemon.volumes.Get(name)
+	if err != nil {
+		return nil, err
+	}
+	return volumeToAPIType(v), nil
 }

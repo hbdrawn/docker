@@ -1,30 +1,25 @@
 package daemon
 
 import (
-	"github.com/docker/docker/engine"
+	derr "github.com/docker/docker/errors"
 )
 
-func (daemon *Daemon) ContainerStop(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("Usage: %s CONTAINER\n", job.Name)
+// ContainerStop looks for the given container and terminates it,
+// waiting the given number of seconds before forcefully killing the
+// container. If a negative number of seconds is given, ContainerStop
+// will wait for a graceful termination. An error is returned if the
+// container is not found, is already stopped, or if there is a
+// problem stopping the container.
+func (daemon *Daemon) ContainerStop(name string, seconds int) error {
+	container, err := daemon.Get(name)
+	if err != nil {
+		return err
 	}
-	var (
-		name = job.Args[0]
-		t    = 10
-	)
-	if job.EnvExists("t") {
-		t = job.GetenvInt("t")
+	if !container.IsRunning() {
+		return derr.ErrorCodeStopped
 	}
-	if container := daemon.Get(name); container != nil {
-		if !container.IsRunning() {
-			return job.Errorf("Container already stopped")
-		}
-		if err := container.Stop(int(t)); err != nil {
-			return job.Errorf("Cannot stop container %s: %s\n", name, err)
-		}
-		container.LogEvent("stop")
-	} else {
-		return job.Errorf("No such container: %s\n", name)
+	if err := container.Stop(seconds); err != nil {
+		return derr.ErrorCodeCantStop.WithArgs(name, err)
 	}
-	return engine.StatusOK
+	return nil
 }

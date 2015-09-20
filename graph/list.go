@@ -2,73 +2,133 @@ package graph
 
 import (
 	"fmt"
-	"log"
 	"path"
+	"sort"
 	"strings"
 
-	"github.com/docker/docker/engine"
+	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/parsers/filters"
+	"github.com/docker/docker/utils"
 )
 
-func (s *TagStore) CmdImages(job *engine.Job) engine.Status {
+var acceptedImageFilterTags = map[string]struct{}{
+	"dangling": {},
+	"label":    {},
+}
+
+// byCreated is a temporary type used to sort a list of images by creation
+// time.
+type byCreated []*types.Image
+
+func (r byCreated) Len() int           { return len(r) }
+func (r byCreated) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+func (r byCreated) Less(i, j int) bool { return r[i].Created < r[j].Created }
+
+// Images returns a filtered list of images. filterArgs is a JSON-encoded set
+// of filter arguments which will be interpreted by pkg/parsers/filters.
+// filter is a shell glob string applied to repository names. The argument
+// named all controls whether all images in the graph are filtered, or just
+// the heads.
+func (s *TagStore) Images(filterArgs, filter string, all bool) ([]*types.Image, error) {
 	var (
-		allImages   map[string]*image.Image
-		err         error
-		filt_tagged = true
+		allImages  map[string]*image.Image
+		err        error
+		filtTagged = true
+		filtLabel  = false
 	)
 
-	imageFilters, err := filters.FromParam(job.Getenv("filters"))
+	imageFilters, err := filters.FromParam(filterArgs)
 	if err != nil {
-		return job.Error(err)
+		return nil, err
 	}
+	for name := range imageFilters {
+		if _, ok := acceptedImageFilterTags[name]; !ok {
+			return nil, fmt.Errorf("Invalid filter '%s'", name)
+		}
+	}
+
 	if i, ok := imageFilters["dangling"]; ok {
 		for _, value := range i {
 			if strings.ToLower(value) == "true" {
-				filt_tagged = false
+				filtTagged = false
 			}
 		}
 	}
 
-	if job.GetenvBool("all") && filt_tagged {
-		allImages, err = s.graph.Map()
+	_, filtLabel = imageFilters["label"]
+
+	if all && filtTagged {
+		allImages = s.graph.Map()
 	} else {
-		allImages, err = s.graph.Heads()
+		allImages = s.graph.Heads()
 	}
-	if err != nil {
-		return job.Error(err)
-	}
-	lookup := make(map[string]*engine.Env)
+
+	lookup := make(map[string]*types.Image)
 	s.Lock()
-	for name, repository := range s.Repositories {
-		if job.Getenv("filter") != "" {
-			if match, _ := path.Match(job.Getenv("filter"), name); !match {
+	for repoName, repository := range s.Repositories {
+		filterTagName := ""
+		if filter != "" {
+			filterName := filter
+			// Test if the tag was in there, if yes, get the name
+			if strings.Contains(filterName, ":") {
+				filterWithTag := strings.Split(filter, ":")
+				filterName = filterWithTag[0]
+				filterTagName = filterWithTag[1]
+			}
+			if match, _ := path.Match(filterName, repoName); !match {
 				continue
 			}
+			if filterTagName != "" {
+				if _, ok := repository[filterTagName]; !ok {
+					continue
+				}
+			}
 		}
-		for tag, id := range repository {
+		for ref, id := range repository {
+			imgRef := utils.ImageReference(repoName, ref)
+			if !strings.Contains(imgRef, filterTagName) {
+				continue
+			}
 			image, err := s.graph.Get(id)
 			if err != nil {
-				log.Printf("Warning: couldn't load %s from %s/%s: %s", id, name, tag, err)
+				logrus.Warnf("couldn't load %s from %s: %s", id, imgRef, err)
 				continue
 			}
 
-			if out, exists := lookup[id]; exists {
-				if filt_tagged {
-					out.SetList("RepoTags", append(out.GetList("RepoTags"), fmt.Sprintf("%s:%s", name, tag)))
+			if lImage, exists := lookup[id]; exists {
+				if filtTagged {
+					if utils.DigestReference(ref) {
+						lImage.RepoDigests = append(lImage.RepoDigests, imgRef)
+					} else { // Tag Ref.
+						lImage.RepoTags = append(lImage.RepoTags, imgRef)
+					}
 				}
 			} else {
 				// get the boolean list for if only the untagged images are requested
 				delete(allImages, id)
-				if filt_tagged {
-					out := &engine.Env{}
-					out.Set("ParentId", image.Parent)
-					out.SetList("RepoTags", []string{fmt.Sprintf("%s:%s", name, tag)})
-					out.Set("Id", image.ID)
-					out.SetInt64("Created", image.Created.Unix())
-					out.SetInt64("Size", image.Size)
-					out.SetInt64("VirtualSize", image.GetParentsSize(0)+image.Size)
-					lookup[id] = out
+				if !imageFilters.MatchKVList("label", image.ContainerConfig.Labels) {
+					continue
+				}
+				if filtTagged {
+					newImage := new(types.Image)
+					newImage.ParentID = image.Parent
+					newImage.ID = image.ID
+					newImage.Created = image.Created.Unix()
+					newImage.Size = image.Size
+					newImage.VirtualSize = s.graph.GetParentsSize(image) + image.Size
+					newImage.Labels = image.ContainerConfig.Labels
+
+					if utils.DigestReference(ref) {
+						newImage.RepoTags = []string{}
+						newImage.RepoDigests = []string{imgRef}
+					} else {
+						newImage.RepoTags = []string{imgRef}
+						newImage.RepoDigests = []string{}
+					}
+
+					lookup[id] = newImage
 				}
 			}
 
@@ -76,28 +136,32 @@ func (s *TagStore) CmdImages(job *engine.Job) engine.Status {
 	}
 	s.Unlock()
 
-	outs := engine.NewTable("Created", len(lookup))
+	images := []*types.Image{}
 	for _, value := range lookup {
-		outs.Add(value)
+		images = append(images, value)
 	}
 
 	// Display images which aren't part of a repository/tag
-	if job.Getenv("filter") == "" {
+	if filter == "" || filtLabel {
 		for _, image := range allImages {
-			out := &engine.Env{}
-			out.Set("ParentId", image.Parent)
-			out.SetList("RepoTags", []string{"<none>:<none>"})
-			out.Set("Id", image.ID)
-			out.SetInt64("Created", image.Created.Unix())
-			out.SetInt64("Size", image.Size)
-			out.SetInt64("VirtualSize", image.GetParentsSize(0)+image.Size)
-			outs.Add(out)
+			if !imageFilters.MatchKVList("label", image.ContainerConfig.Labels) {
+				continue
+			}
+			newImage := new(types.Image)
+			newImage.ParentID = image.Parent
+			newImage.RepoTags = []string{"<none>:<none>"}
+			newImage.RepoDigests = []string{"<none>@<none>"}
+			newImage.ID = image.ID
+			newImage.Created = image.Created.Unix()
+			newImage.Size = image.Size
+			newImage.VirtualSize = s.graph.GetParentsSize(image) + image.Size
+			newImage.Labels = image.ContainerConfig.Labels
+
+			images = append(images, newImage)
 		}
 	}
 
-	outs.ReverseSort()
-	if _, err := outs.WriteListTo(job.Stdout); err != nil {
-		return job.Error(err)
-	}
-	return engine.StatusOK
+	sort.Sort(sort.Reverse(byCreated(images)))
+
+	return images, nil
 }

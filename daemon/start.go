@@ -1,73 +1,52 @@
 package daemon
 
 import (
-	"fmt"
-	"os"
-	"strings"
+	"runtime"
 
-	"github.com/docker/docker/engine"
+	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/runconfig"
+	"github.com/docker/docker/utils"
 )
 
-func (daemon *Daemon) ContainerStart(job *engine.Job) engine.Status {
-	if len(job.Args) < 1 {
-		return job.Errorf("Usage: %s container_id", job.Name)
+// ContainerStart starts a container.
+func (daemon *Daemon) ContainerStart(name string, hostConfig *runconfig.HostConfig) error {
+	container, err := daemon.Get(name)
+	if err != nil {
+		return err
 	}
-	var (
-		name      = job.Args[0]
-		container = daemon.Get(name)
-	)
 
-	if container == nil {
-		return job.Errorf("No such container: %s", name)
+	if container.isPaused() {
+		return derr.ErrorCodeStartPaused
 	}
 
 	if container.IsRunning() {
-		return job.Errorf("Container already started")
+		return derr.ErrorCodeAlreadyStarted
 	}
 
-	// If no environment was set, then no hostconfig was passed.
-	// This is kept for backward compatibility - hostconfig should be passed when
-	// creating a container, not during start.
-	if len(job.Environ()) > 0 {
-		hostConfig := runconfig.ContainerHostConfigFromJob(job)
-		if err := daemon.setHostConfig(container, hostConfig); err != nil {
-			return job.Error(err)
-		}
-	}
-	if err := container.Start(); err != nil {
-		container.LogEvent("die")
-		return job.Errorf("Cannot start container %s: %s", name, err)
-	}
-
-	return engine.StatusOK
-}
-
-func (daemon *Daemon) setHostConfig(container *Container, hostConfig *runconfig.HostConfig) error {
-	if err := parseSecurityOpt(container, hostConfig); err != nil {
-		return err
-	}
-	// Validate the HostConfig binds. Make sure that:
-	// the source exists
-	for _, bind := range hostConfig.Binds {
-		splitBind := strings.Split(bind, ":")
-		source := splitBind[0]
-
-		// ensure the source exists on the host
-		_, err := os.Stat(source)
-		if err != nil && os.IsNotExist(err) {
-			err = os.MkdirAll(source, 0755)
-			if err != nil {
-				return fmt.Errorf("Could not create local directory '%s' for bind mount: %s!", source, err.Error())
+	// Windows does not have the backwards compatibility issue here.
+	if runtime.GOOS != "windows" {
+		// This is kept for backward compatibility - hostconfig should be passed when
+		// creating a container, not during start.
+		if hostConfig != nil {
+			if err := daemon.setHostConfig(container, hostConfig); err != nil {
+				return err
 			}
 		}
+	} else {
+		if hostConfig != nil {
+			return derr.ErrorCodeHostConfigStart
+		}
 	}
-	// Register any links from the host config before starting the container
-	if err := daemon.RegisterLinks(container, hostConfig); err != nil {
+
+	// check if hostConfig is in line with the current system settings.
+	// It may happen cgroups are umounted or the like.
+	if _, err = daemon.verifyContainerSettings(container.hostConfig, nil); err != nil {
 		return err
 	}
-	container.SetHostConfig(hostConfig)
-	container.ToDisk()
+
+	if err := container.Start(); err != nil {
+		return derr.ErrorCodeCantStart.WithArgs(name, utils.GetErrorMessage(err))
+	}
 
 	return nil
 }

@@ -2,138 +2,183 @@ package main
 
 import (
 	"fmt"
-	"os/exec"
 	"strings"
-	"testing"
 	"time"
+
+	"github.com/go-check/check"
 )
 
 // Regression test for https://github.com/docker/docker/issues/7843
-func TestStartAttachReturnsOnError(t *testing.T) {
-	defer deleteAllContainers()
-
-	dockerCmd(t, "run", "-d", "--name", "test", "busybox")
-	dockerCmd(t, "stop", "test")
+func (s *DockerSuite) TestStartAttachReturnsOnError(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	dockerCmd(c, "run", "-d", "--name", "test", "busybox")
+	dockerCmd(c, "wait", "test")
 
 	// Expect this to fail because the above container is stopped, this is what we want
-	if _, err := runCommand(exec.Command(dockerBinary, "run", "-d", "--name", "test2", "--link", "test:test", "busybox")); err == nil {
-		t.Fatal("Expected error but got none")
+	if _, _, err := dockerCmdWithError("run", "-d", "--name", "test2", "--link", "test:test", "busybox"); err == nil {
+		c.Fatal("Expected error but got none")
 	}
 
-	ch := make(chan struct{})
+	ch := make(chan error)
 	go func() {
 		// Attempt to start attached to the container that won't start
 		// This should return an error immediately since the container can't be started
-		if _, err := runCommand(exec.Command(dockerBinary, "start", "-a", "test2")); err == nil {
-			t.Fatal("Expected error but got none")
+		if _, _, err := dockerCmdWithError("start", "-a", "test2"); err == nil {
+			ch <- fmt.Errorf("Expected error but got none")
 		}
 		close(ch)
 	}()
 
 	select {
-	case <-ch:
+	case err := <-ch:
+		c.Assert(err, check.IsNil)
 	case <-time.After(time.Second):
-		t.Fatalf("Attach did not exit properly")
+		c.Fatalf("Attach did not exit properly")
 	}
-
-	logDone("start - error on start with attach exits")
 }
 
 // gh#8555: Exit code should be passed through when using start -a
-func TestStartAttachCorrectExitCode(t *testing.T) {
-	defer deleteAllContainers()
-
-	runCmd := exec.Command(dockerBinary, "run", "-d", "busybox", "sh", "-c", "sleep 2; exit 1")
-	out, _, _, err := runCommandWithStdoutStderr(runCmd)
-	if err != nil {
-		t.Fatalf("failed to run container: %v, output: %q", err, out)
-	}
-
-	out = stripTrailingCharacters(out)
+func (s *DockerSuite) TestStartAttachCorrectExitCode(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	out, _, _ := dockerCmdWithStdoutStderr(c, "run", "-d", "busybox", "sh", "-c", "sleep 2; exit 1")
+	out = strings.TrimSpace(out)
 
 	// make sure the container has exited before trying the "start -a"
-	waitCmd := exec.Command(dockerBinary, "wait", out)
-	if out, _, err = runCommandWithOutput(waitCmd); err != nil {
-		t.Fatal(out, err)
-	}
+	dockerCmd(c, "wait", out)
 
-	startCmd := exec.Command(dockerBinary, "start", "-a", out)
-	startOut, exitCode, err := runCommandWithOutput(startCmd)
+	startOut, exitCode, err := dockerCmdWithError("start", "-a", out)
 	if err != nil && !strings.Contains("exit status 1", fmt.Sprintf("%s", err)) {
-		t.Fatalf("start command failed unexpectedly with error: %v, output: %q", err, startOut)
+		c.Fatalf("start command failed unexpectedly with error: %v, output: %q", err, startOut)
 	}
 	if exitCode != 1 {
-		t.Fatalf("start -a did not respond with proper exit code: expected 1, got %d", exitCode)
+		c.Fatalf("start -a did not respond with proper exit code: expected 1, got %d", exitCode)
 	}
 
-	logDone("start - correct exit code returned with -a")
 }
 
-func TestStartRecordError(t *testing.T) {
-	defer deleteAllContainers()
+func (s *DockerSuite) TestStartAttachSilent(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	name := "teststartattachcorrectexitcode"
+	dockerCmd(c, "run", "--name", name, "busybox", "echo", "test")
 
-	// when container runs successfully, we should not have state.Error
-	dockerCmd(t, "run", "-d", "-p", "9999:9999", "--name", "test", "busybox", "top")
-	stateErr, err := inspectField("test", "State.Error")
-	if err != nil {
-		t.Fatalf("Failed to inspect %q state's error, got error %q", "test", err)
+	// make sure the container has exited before trying the "start -a"
+	dockerCmd(c, "wait", name)
+
+	startOut, _ := dockerCmd(c, "start", "-a", name)
+	if expected := "test\n"; startOut != expected {
+		c.Fatalf("start -a produced unexpected output: expected %q, got %q", expected, startOut)
 	}
+}
+
+func (s *DockerSuite) TestStartRecordError(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	// when container runs successfully, we should not have state.Error
+	dockerCmd(c, "run", "-d", "-p", "9999:9999", "--name", "test", "busybox", "top")
+	stateErr, err := inspectField("test", "State.Error")
+	c.Assert(err, check.IsNil)
 	if stateErr != "" {
-		t.Fatalf("Expected to not have state error but got state.Error(%q)", stateErr)
+		c.Fatalf("Expected to not have state error but got state.Error(%q)", stateErr)
 	}
 
 	// Expect this to fail and records error because of ports conflict
-	out, _, err := runCommandWithOutput(exec.Command(dockerBinary, "run", "-d", "--name", "test2", "-p", "9999:9999", "busybox", "top"))
+	out, _, err := dockerCmdWithError("run", "-d", "--name", "test2", "-p", "9999:9999", "busybox", "top")
 	if err == nil {
-		t.Fatalf("Expected error but got none, output %q", out)
+		c.Fatalf("Expected error but got none, output %q", out)
 	}
+
 	stateErr, err = inspectField("test2", "State.Error")
-	if err != nil {
-		t.Fatalf("Failed to inspect %q state's error, got error %q", "test2", err)
-	}
+	c.Assert(err, check.IsNil)
 	expected := "port is already allocated"
 	if stateErr == "" || !strings.Contains(stateErr, expected) {
-		t.Fatalf("State.Error(%q) does not include %q", stateErr, expected)
+		c.Fatalf("State.Error(%q) does not include %q", stateErr, expected)
 	}
 
 	// Expect the conflict to be resolved when we stop the initial container
-	dockerCmd(t, "stop", "test")
-	dockerCmd(t, "start", "test2")
+	dockerCmd(c, "stop", "test")
+	dockerCmd(c, "start", "test2")
 	stateErr, err = inspectField("test2", "State.Error")
-	if err != nil {
-		t.Fatalf("Failed to inspect %q state's error, got error %q", "test", err)
-	}
+	c.Assert(err, check.IsNil)
 	if stateErr != "" {
-		t.Fatalf("Expected to not have state error but got state.Error(%q)", stateErr)
+		c.Fatalf("Expected to not have state error but got state.Error(%q)", stateErr)
 	}
-
-	logDone("start - set state error when start fails")
 }
 
-// gh#8726: a failed Start() breaks --volumes-from on subsequent Start()'s
-func TestStartVolumesFromFailsCleanly(t *testing.T) {
-	defer deleteAllContainers()
+func (s *DockerSuite) TestStartPausedContainer(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	defer unpauseAllContainers()
 
-	// Create the first data volume
-	dockerCmd(t, "run", "-d", "--name", "data_before", "-v", "/foo", "busybox")
+	dockerCmd(c, "run", "-d", "--name", "testing", "busybox", "top")
 
-	// Expect this to fail because the data test after contaienr doesn't exist yet
-	if _, err := runCommand(exec.Command(dockerBinary, "run", "-d", "--name", "consumer", "--volumes-from", "data_before", "--volumes-from", "data_after", "busybox")); err == nil {
-		t.Fatal("Expected error but got none")
+	dockerCmd(c, "pause", "testing")
+
+	if out, _, err := dockerCmdWithError("start", "testing"); err == nil || !strings.Contains(out, "Cannot start a paused container, try unpause instead.") {
+		c.Fatalf("an error should have been shown that you cannot start paused container: %s\n%v", out, err)
+	}
+}
+
+func (s *DockerSuite) TestStartMultipleContainers(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	// run a container named 'parent' and create two container link to `parent`
+	dockerCmd(c, "run", "-d", "--name", "parent", "busybox", "top")
+
+	for _, container := range []string{"child_first", "child_second"} {
+		dockerCmd(c, "create", "--name", container, "--link", "parent:parent", "busybox", "top")
 	}
 
-	// Create the second data volume
-	dockerCmd(t, "run", "-d", "--name", "data_after", "-v", "/bar", "busybox")
+	// stop 'parent' container
+	dockerCmd(c, "stop", "parent")
 
-	// Now, all the volumes should be there
-	dockerCmd(t, "start", "consumer")
-
-	// Check that we have the volumes we want
-	out, _, _ := dockerCmd(t, "inspect", "--format='{{ len .Volumes }}'", "consumer")
-	n_volumes := strings.Trim(out, " \r\n'")
-	if n_volumes != "2" {
-		t.Fatalf("Missing volumes: expected 2, got %s", n_volumes)
+	out, err := inspectField("parent", "State.Running")
+	c.Assert(err, check.IsNil)
+	if out != "false" {
+		c.Fatal("Container should be stopped")
 	}
 
-	logDone("start - missing containers in --volumes-from did not affect subsequent runs")
+	// start all the three containers, container `child_first` start first which should be failed
+	// container 'parent' start second and then start container 'child_second'
+	out, _, err = dockerCmdWithError("start", "child_first", "parent", "child_second")
+	if !strings.Contains(out, "Cannot start container child_first") || err == nil {
+		c.Fatal("Expected error but got none")
+	}
+
+	for container, expected := range map[string]string{"parent": "true", "child_first": "false", "child_second": "true"} {
+		out, err := inspectField(container, "State.Running")
+		c.Assert(err, check.IsNil)
+		if out != expected {
+			c.Fatal("Container running state wrong")
+		}
+
+	}
+}
+
+func (s *DockerSuite) TestStartAttachMultipleContainers(c *check.C) {
+	testRequires(c, DaemonIsLinux)
+	// run  multiple containers to test
+	for _, container := range []string{"test1", "test2", "test3"} {
+		dockerCmd(c, "run", "-d", "--name", container, "busybox", "top")
+	}
+
+	// stop all the containers
+	for _, container := range []string{"test1", "test2", "test3"} {
+		dockerCmd(c, "stop", container)
+	}
+
+	// test start and attach multiple containers at once, expected error
+	for _, option := range []string{"-a", "-i", "-ai"} {
+		out, _, err := dockerCmdWithError("start", option, "test1", "test2", "test3")
+		if !strings.Contains(out, "You cannot start and attach multiple containers at once.") || err == nil {
+			c.Fatal("Expected error but got none")
+		}
+	}
+
+	// confirm the state of all the containers be stopped
+	for container, expected := range map[string]string{"test1": "false", "test2": "false", "test3": "false"} {
+		out, err := inspectField(container, "State.Running")
+		if err != nil {
+			c.Fatal(out, err)
+		}
+		if out != expected {
+			c.Fatal("Container running state wrong")
+		}
+	}
 }

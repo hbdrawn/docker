@@ -6,6 +6,7 @@ import (
 	"testing"
 )
 
+// TestFromStatT tests fromStatT for a tempfile
 func TestFromStatT(t *testing.T) {
 	file, _, _, dir := prepareFiles(t)
 	defer os.RemoveAll(dir)
@@ -21,7 +22,7 @@ func TestFromStatT(t *testing.T) {
 	if stat.Mode != s.Mode() {
 		t.Fatal("got invalid mode")
 	}
-	if stat.Uid != s.Uid() {
+	if stat.Uid != s.UID() {
 		t.Fatal("got invalid uid")
 	}
 	if stat.Gid != s.Gid() {

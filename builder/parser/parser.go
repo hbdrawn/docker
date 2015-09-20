@@ -1,4 +1,4 @@
-// This package implements a parser and parse tree dumper for Dockerfiles.
+// Package parser implements a parser and parse tree dumper for Dockerfiles.
 package parser
 
 import (
@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+
+	"github.com/docker/docker/builder/command"
 )
 
 // Node is a structure used to represent a parse tree.
@@ -27,37 +29,40 @@ type Node struct {
 	Children   []*Node         // the children of this sexp
 	Attributes map[string]bool // special attributes for this node
 	Original   string          // original line used before parsing
+	Flags      []string        // only top Node should have this set
 }
 
 var (
-	dispatch                map[string]func(string) (*Node, map[string]bool, error)
-	TOKEN_WHITESPACE        = regexp.MustCompile(`[\t\v\f\r ]+`)
-	TOKEN_LINE_CONTINUATION = regexp.MustCompile(`\\\s*$`)
-	TOKEN_COMMENT           = regexp.MustCompile(`^#.*$`)
+	dispatch              map[string]func(string) (*Node, map[string]bool, error)
+	tokenWhitespace       = regexp.MustCompile(`[\t\v\f\r ]+`)
+	tokenLineContinuation = regexp.MustCompile(`\\[ \t]*$`)
+	tokenComment          = regexp.MustCompile(`^#.*$`)
 )
 
 func init() {
 	// Dispatch Table. see line_parsers.go for the parse functions.
 	// The command is parsed and mapped to the line parser. The line parser
-	// recieves the arguments but not the command, and returns an AST after
+	// receives the arguments but not the command, and returns an AST after
 	// reformulating the arguments according to the rules in the parser
-	// functions. Errors are propogated up by Parse() and the resulting AST can
+	// functions. Errors are propagated up by Parse() and the resulting AST can
 	// be incorporated directly into the existing AST as a next.
 	dispatch = map[string]func(string) (*Node, map[string]bool, error){
-		"user":       parseString,
-		"onbuild":    parseSubCommand,
-		"workdir":    parseString,
-		"env":        parseEnv,
-		"maintainer": parseString,
-		"from":       parseString,
-		"add":        parseStringsWhitespaceDelimited,
-		"copy":       parseStringsWhitespaceDelimited,
-		"run":        parseMaybeJSON,
-		"cmd":        parseMaybeJSON,
-		"entrypoint": parseMaybeJSON,
-		"expose":     parseStringsWhitespaceDelimited,
-		"volume":     parseMaybeJSONToList,
-		"insert":     parseIgnore,
+		command.User:       parseString,
+		command.Onbuild:    parseSubCommand,
+		command.Workdir:    parseString,
+		command.Env:        parseEnv,
+		command.Label:      parseLabel,
+		command.Maintainer: parseString,
+		command.From:       parseString,
+		command.Add:        parseMaybeJSONToList,
+		command.Copy:       parseMaybeJSONToList,
+		command.Run:        parseMaybeJSON,
+		command.Cmd:        parseMaybeJSON,
+		command.Entrypoint: parseMaybeJSON,
+		command.Expose:     parseStringsWhitespaceDelimited,
+		command.Volume:     parseMaybeJSONToList,
+		command.StopSignal: parseString,
+		command.Arg:        parseNameOrNameVal,
 	}
 }
 
@@ -67,12 +72,12 @@ func parseLine(line string) (string, *Node, error) {
 		return "", nil, nil
 	}
 
-	if TOKEN_LINE_CONTINUATION.MatchString(line) {
-		line = TOKEN_LINE_CONTINUATION.ReplaceAllString(line, "")
+	if tokenLineContinuation.MatchString(line) {
+		line = tokenLineContinuation.ReplaceAllString(line, "")
 		return line, nil, nil
 	}
 
-	cmd, args, err := splitCommand(line)
+	cmd, flags, args, err := splitCommand(line)
 	if err != nil {
 		return "", nil, err
 	}
@@ -85,18 +90,16 @@ func parseLine(line string) (string, *Node, error) {
 		return "", nil, err
 	}
 
-	if sexp.Value != "" || sexp.Next != nil || sexp.Children != nil {
-		node.Next = sexp
-	}
-
+	node.Next = sexp
 	node.Attributes = attrs
 	node.Original = line
+	node.Flags = flags
 
 	return "", node, nil
 }
 
-// The main parse routine. Handles an io.ReadWriteCloser and returns the root
-// of the AST.
+// Parse is the main parse routine.
+// It handles an io.ReadWriteCloser and returns the root of the AST.
 func Parse(rwc io.Reader) (*Node, error) {
 	root := &Node{}
 	scanner := bufio.NewScanner(rwc)

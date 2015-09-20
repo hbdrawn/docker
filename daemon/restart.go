@@ -1,27 +1,20 @@
 package daemon
 
-import (
-	"github.com/docker/docker/engine"
-)
+import "fmt"
 
-func (daemon *Daemon) ContainerRestart(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("Usage: %s CONTAINER\n", job.Name)
+// ContainerRestart stops and starts a container. It attempts to
+// gracefully stop the container within the given timeout, forcefully
+// stopping it if the timeout is exceeded. If given a negative
+// timeout, ContainerRestart will wait forever until a graceful
+// stop. Returns an error if the container cannot be found, or if
+// there is an underlying error at any stage of the restart.
+func (daemon *Daemon) ContainerRestart(name string, seconds int) error {
+	container, err := daemon.Get(name)
+	if err != nil {
+		return err
 	}
-	var (
-		name = job.Args[0]
-		t    = 10
-	)
-	if job.EnvExists("t") {
-		t = job.GetenvInt("t")
+	if err := container.Restart(seconds); err != nil {
+		return fmt.Errorf("Cannot restart container %s: %s\n", name, err)
 	}
-	if container := daemon.Get(name); container != nil {
-		if err := container.Restart(int(t)); err != nil {
-			return job.Errorf("Cannot restart container %s: %s\n", name, err)
-		}
-		container.LogEvent("restart")
-	} else {
-		return job.Errorf("No such container: %s\n", name)
-	}
-	return engine.StatusOK
+	return nil
 }

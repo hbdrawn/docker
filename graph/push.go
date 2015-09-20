@@ -3,248 +3,124 @@ package graph
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
-	"os"
-	"path"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/pkg/archive"
+	"github.com/Sirupsen/logrus"
+	"github.com/docker/distribution/digest"
+	"github.com/docker/docker/cliconfig"
+	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/registry"
-	"github.com/docker/docker/utils"
 )
 
-// Retrieve the all the images to be uploaded in the correct order
-func (s *TagStore) getImageList(localRepo map[string]string, requestedTag string) ([]string, map[string][]string, error) {
-	var (
-		imageList   []string
-		imagesSeen  = make(map[string]bool)
-		tagsByImage = make(map[string][]string)
-	)
+// ImagePushConfig stores push configuration.
+type ImagePushConfig struct {
+	// MetaHeaders store HTTP headers with metadata about the image
+	// (DockerHeaders with prefix X-Meta- in the request).
+	MetaHeaders map[string][]string
+	// AuthConfig holds authentication credentials for authenticating with
+	// the registry.
+	AuthConfig *cliconfig.AuthConfig
+	// Tag is the specific variant of the image to be pushed.
+	// If no tag is provided, all tags will be pushed.
+	Tag string
+	// OutStream is the output writer for showing the status of the push
+	// operation.
+	OutStream io.Writer
+}
 
-	for tag, id := range localRepo {
-		if requestedTag != "" && requestedTag != tag {
+// Pusher is an interface that abstracts pushing for different API versions.
+type Pusher interface {
+	// Push tries to push the image configured at the creation of Pusher.
+	// Push returns an error if any, as well as a boolean that determines whether to retry Push on the next configured endpoint.
+	//
+	// TODO(tiborvass): have Push() take a reference to repository + tag, so that the pusher itself is repository-agnostic.
+	Push() (fallback bool, err error)
+}
+
+// NewPusher creates a new Pusher interface that will push to either a v1 or v2
+// registry. The endpoint argument contains a Version field that determines
+// whether a v1 or v2 pusher will be created. The other parameters are passed
+// through to the underlying pusher implementation for use during the actual
+// push operation.
+func (s *TagStore) NewPusher(endpoint registry.APIEndpoint, localRepo Repository, repoInfo *registry.RepositoryInfo, imagePushConfig *ImagePushConfig, sf *streamformatter.StreamFormatter) (Pusher, error) {
+	switch endpoint.Version {
+	case registry.APIVersion2:
+		return &v2Pusher{
+			TagStore:     s,
+			endpoint:     endpoint,
+			localRepo:    localRepo,
+			repoInfo:     repoInfo,
+			config:       imagePushConfig,
+			sf:           sf,
+			layersPushed: make(map[digest.Digest]bool),
+		}, nil
+	case registry.APIVersion1:
+		return &v1Pusher{
+			TagStore:  s,
+			endpoint:  endpoint,
+			localRepo: localRepo,
+			repoInfo:  repoInfo,
+			config:    imagePushConfig,
+			sf:        sf,
+		}, nil
+	}
+	return nil, fmt.Errorf("unknown version %d for registry %s", endpoint.Version, endpoint.URL)
+}
+
+// Push initiates a push operation on the repository named localName.
+func (s *TagStore) Push(localName string, imagePushConfig *ImagePushConfig) error {
+	// FIXME: Allow to interrupt current push when new push of same image is done.
+
+	var sf = streamformatter.NewJSONStreamFormatter()
+
+	// Resolve the Repository name from fqn to RepositoryInfo
+	repoInfo, err := s.registryService.ResolveRepository(localName)
+	if err != nil {
+		return err
+	}
+
+	endpoints, err := s.registryService.LookupPushEndpoints(repoInfo.CanonicalName)
+	if err != nil {
+		return err
+	}
+
+	reposLen := 1
+	if imagePushConfig.Tag == "" {
+		reposLen = len(s.Repositories[repoInfo.LocalName])
+	}
+
+	imagePushConfig.OutStream.Write(sf.FormatStatus("", "The push refers to a repository [%s] (len: %d)", repoInfo.CanonicalName, reposLen))
+
+	// If it fails, try to get the repository
+	localRepo, exists := s.Repositories[repoInfo.LocalName]
+	if !exists {
+		return fmt.Errorf("Repository does not exist: %s", repoInfo.LocalName)
+	}
+
+	var lastErr error
+	for _, endpoint := range endpoints {
+		logrus.Debugf("Trying to push %s to %s %s", repoInfo.CanonicalName, endpoint.URL, endpoint.Version)
+
+		pusher, err := s.NewPusher(endpoint, localRepo, repoInfo, imagePushConfig, sf)
+		if err != nil {
+			lastErr = err
 			continue
 		}
-		var imageListForThisTag []string
-
-		tagsByImage[id] = append(tagsByImage[id], tag)
-
-		for img, err := s.graph.Get(id); img != nil; img, err = img.GetParent() {
-			if err != nil {
-				return nil, nil, err
+		if fallback, err := pusher.Push(); err != nil {
+			if fallback {
+				lastErr = err
+				continue
 			}
-
-			if imagesSeen[img.ID] {
-				// This image is already on the list, we can ignore it and all its parents
-				break
-			}
-
-			imagesSeen[img.ID] = true
-			imageListForThisTag = append(imageListForThisTag, img.ID)
-		}
-
-		// reverse the image list for this tag (so the "most"-parent image is first)
-		for i, j := 0, len(imageListForThisTag)-1; i < j; i, j = i+1, j-1 {
-			imageListForThisTag[i], imageListForThisTag[j] = imageListForThisTag[j], imageListForThisTag[i]
-		}
-
-		// append to main image list
-		imageList = append(imageList, imageListForThisTag...)
-	}
-	if len(imageList) == 0 {
-		return nil, nil, fmt.Errorf("No images found for the requested repository / tag")
-	}
-	log.Debugf("Image list: %v", imageList)
-	log.Debugf("Tags by image: %v", tagsByImage)
-
-	return imageList, tagsByImage, nil
-}
-
-func (s *TagStore) pushRepository(r *registry.Session, out io.Writer, localName, remoteName string, localRepo map[string]string, tag string, sf *utils.StreamFormatter) error {
-	out = utils.NewWriteFlusher(out)
-	log.Debugf("Local repo: %s", localRepo)
-	imgList, tagsByImage, err := s.getImageList(localRepo, tag)
-	if err != nil {
-		return err
-	}
-
-	out.Write(sf.FormatStatus("", "Sending image list"))
-
-	var (
-		repoData   *registry.RepositoryData
-		imageIndex []*registry.ImgData
-	)
-
-	for _, imgId := range imgList {
-		if tags, exists := tagsByImage[imgId]; exists {
-			// If an image has tags you must add an entry in the image index
-			// for each tag
-			for _, tag := range tags {
-				imageIndex = append(imageIndex, &registry.ImgData{
-					ID:  imgId,
-					Tag: tag,
-				})
-			}
-		} else {
-			// If the image does not have a tag it still needs to be sent to the
-			// registry with an empty tag so that it is accociated with the repository
-			imageIndex = append(imageIndex, &registry.ImgData{
-				ID:  imgId,
-				Tag: "",
-			})
+			logrus.Debugf("Not continuing with error: %v", err)
+			return err
 
 		}
+
+		s.eventsService.Log("push", repoInfo.LocalName, "")
+		return nil
 	}
 
-	log.Debugf("Preparing to push %s with the following images and tags", localRepo)
-	for _, data := range imageIndex {
-		log.Debugf("Pushing ID: %s with Tag: %s", data.ID, data.Tag)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no endpoints found for %s", repoInfo.CanonicalName)
 	}
-
-	// Register all the images in a repository with the registry
-	// If an image is not in this list it will not be associated with the repository
-	repoData, err = r.PushImageJSONIndex(remoteName, imageIndex, false, nil)
-	if err != nil {
-		return err
-	}
-
-	nTag := 1
-	if tag == "" {
-		nTag = len(localRepo)
-	}
-	for _, ep := range repoData.Endpoints {
-		out.Write(sf.FormatStatus("", "Pushing repository %s (%d tags)", localName, nTag))
-
-		for _, imgId := range imgList {
-			if r.LookupRemoteImage(imgId, ep, repoData.Tokens) {
-				out.Write(sf.FormatStatus("", "Image %s already pushed, skipping", utils.TruncateID(imgId)))
-			} else {
-				if _, err := s.pushImage(r, out, remoteName, imgId, ep, repoData.Tokens, sf); err != nil {
-					// FIXME: Continue on error?
-					return err
-				}
-			}
-
-			for _, tag := range tagsByImage[imgId] {
-				out.Write(sf.FormatStatus("", "Pushing tag for rev [%s] on {%s}", utils.TruncateID(imgId), ep+"repositories/"+remoteName+"/tags/"+tag))
-
-				if err := r.PushRegistryTag(remoteName, imgId, tag, ep, repoData.Tokens); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	if _, err := r.PushImageJSONIndex(remoteName, imageIndex, true, repoData.Endpoints); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *TagStore) pushImage(r *registry.Session, out io.Writer, remote, imgID, ep string, token []string, sf *utils.StreamFormatter) (checksum string, err error) {
-	out = utils.NewWriteFlusher(out)
-	jsonRaw, err := ioutil.ReadFile(path.Join(s.graph.Root, imgID, "json"))
-	if err != nil {
-		return "", fmt.Errorf("Cannot retrieve the path for {%s}: %s", imgID, err)
-	}
-	out.Write(sf.FormatProgress(utils.TruncateID(imgID), "Pushing", nil))
-
-	imgData := &registry.ImgData{
-		ID: imgID,
-	}
-
-	// Send the json
-	if err := r.PushImageJSONRegistry(imgData, jsonRaw, ep, token); err != nil {
-		if err == registry.ErrAlreadyExists {
-			out.Write(sf.FormatProgress(utils.TruncateID(imgData.ID), "Image already pushed, skipping", nil))
-			return "", nil
-		}
-		return "", err
-	}
-
-	layerData, err := s.graph.TempLayerArchive(imgID, archive.Uncompressed, sf, out)
-	if err != nil {
-		return "", fmt.Errorf("Failed to generate layer archive: %s", err)
-	}
-	defer os.RemoveAll(layerData.Name())
-
-	// Send the layer
-	log.Debugf("rendered layer for %s of [%d] size", imgData.ID, layerData.Size)
-
-	checksum, checksumPayload, err := r.PushImageLayerRegistry(imgData.ID, utils.ProgressReader(layerData, int(layerData.Size), out, sf, false, utils.TruncateID(imgData.ID), "Pushing"), ep, token, jsonRaw)
-	if err != nil {
-		return "", err
-	}
-	imgData.Checksum = checksum
-	imgData.ChecksumPayload = checksumPayload
-	// Send the checksum
-	if err := r.PushImageChecksumRegistry(imgData, ep, token); err != nil {
-		return "", err
-	}
-
-	out.Write(sf.FormatProgress(utils.TruncateID(imgData.ID), "Image successfully pushed", nil))
-	return imgData.Checksum, nil
-}
-
-// FIXME: Allow to interrupt current push when new push of same image is done.
-func (s *TagStore) CmdPush(job *engine.Job) engine.Status {
-	if n := len(job.Args); n != 1 {
-		return job.Errorf("Usage: %s IMAGE", job.Name)
-	}
-	var (
-		localName   = job.Args[0]
-		sf          = utils.NewStreamFormatter(job.GetenvBool("json"))
-		authConfig  = &registry.AuthConfig{}
-		metaHeaders map[string][]string
-	)
-
-	tag := job.Getenv("tag")
-	job.GetenvJson("authConfig", authConfig)
-	job.GetenvJson("metaHeaders", &metaHeaders)
-	if _, err := s.poolAdd("push", localName); err != nil {
-		return job.Error(err)
-	}
-	defer s.poolRemove("push", localName)
-
-	// Resolve the Repository name from fqn to endpoint + name
-	hostname, remoteName, err := registry.ResolveRepositoryName(localName)
-	if err != nil {
-		return job.Error(err)
-	}
-
-	endpoint, err := registry.NewEndpoint(hostname, s.insecureRegistries)
-	if err != nil {
-		return job.Error(err)
-	}
-
-	img, err := s.graph.Get(localName)
-	r, err2 := registry.NewSession(authConfig, registry.HTTPRequestFactory(metaHeaders), endpoint, false)
-	if err2 != nil {
-		return job.Error(err2)
-	}
-
-	if err != nil {
-		reposLen := 1
-		if tag == "" {
-			reposLen = len(s.Repositories[localName])
-		}
-		job.Stdout.Write(sf.FormatStatus("", "The push refers to a repository [%s] (len: %d)", localName, reposLen))
-		// If it fails, try to get the repository
-		if localRepo, exists := s.Repositories[localName]; exists {
-			if err := s.pushRepository(r, job.Stdout, localName, remoteName, localRepo, tag, sf); err != nil {
-				return job.Error(err)
-			}
-			return engine.StatusOK
-		}
-		return job.Error(err)
-	}
-
-	var token []string
-	job.Stdout.Write(sf.FormatStatus("", "The push refers to an image: [%s]", localName))
-	if _, err := s.pushImage(r, job.Stdout, remoteName, img.ID, endpoint.String(), token, sf); err != nil {
-		return job.Error(err)
-	}
-	return engine.StatusOK
+	return lastErr
 }
